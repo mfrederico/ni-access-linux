@@ -426,20 +426,117 @@ async function processDeployments(deploymentsWithIds) {
       if (dep) dep.state = 3; // INSTALLING
       await publishEvent(24, evBody); // installationStartedEvent
 
-      if (dep) dep.state = 4; // COMPLETED
-      await publishEvent(26, evBody); // installationSucceededEvent
+      // Auto-install Windows plugins via Proton
+      if (filename.endsWith(".zip")) {
+        try {
+          await installViaProton(dest, filename, deploymentId, upid);
+          installedProducts.add(upid);
+        } catch (e) {
+          log("error", `Proton install failed: ${e.message}`);
+        }
+      }
 
-      // Mark as installed and remove from active
-      installedProducts.add(upid);
+      if (dep) dep.state = 4; // COMPLETED
       activeDeployments.delete(deploymentId);
+      await publishEvent(26, evBody); // installationSucceededEvent
       await publishEvent(90); // downloadQueueChangedEvent
-      await publishEvent(85); // productListRefreshedEvent — triggers UI to re-fetch products
+      await publishEvent(85); // productListRefreshedEvent
       log("info", `Completed: ${filename}`);
     } catch (e) {
       log("error", `Download failed: ${e.message}`);
       publishEvent(22, evBody); // downloadFailedEvent
     }
   }
+}
+
+async function installViaProton(zipPath, filename, deploymentId, upid) {
+  const { execSync, exec } = await import("child_process");
+
+  // Find Proton
+  const protonPaths = [
+    join(homedir(), ".steam/steam/steamapps/common/Proton 9.0 (Beta)/proton"),
+    join(homedir(), ".steam/steam/steamapps/common/Proton Hotfix/proton"),
+    join(homedir(), ".steam/steam/steamapps/common/Proton 10.0/proton"),
+    join(homedir(), ".steam/steam/steamapps/common/Proton - Experimental/proton"),
+  ];
+  const protonPath = protonPaths.find(p => existsSync(p));
+  if (!protonPath) { log("error", "No Proton found"); throw new Error("No Proton found"); }
+
+  // Use a shared prefix for all NI plugins
+  const compatPath = join(homedir(), ".steam/steam/steamapps/compatdata/ni-plugins");
+  mkdirSync(compatPath, { recursive: true });
+
+  // If prefix doesn't exist yet, copy from an existing one or create new
+  if (!existsSync(join(compatPath, "pfx/drive_c"))) {
+    // Check for existing working prefix
+    const existingPrefixes = ["3486537896", "3632110230"];
+    let copied = false;
+    for (const id of existingPrefixes) {
+      const src = join(homedir(), `.steam/steam/steamapps/compatdata/${id}/pfx`);
+      if (existsSync(join(src, "drive_c/windows/system32/cmd.exe"))) {
+        log("info", `Copying prefix from ${id}...`);
+        execSync(`cp -a "${src}" "${join(compatPath, "pfx")}"`, { timeout: 60000 });
+        copied = true;
+        break;
+      }
+    }
+    if (!copied) {
+      log("info", "Creating new Proton prefix...");
+      // Let proton create it
+    }
+  }
+
+  const env = {
+    ...process.env,
+    STEAM_COMPAT_DATA_PATH: compatPath,
+    STEAM_COMPAT_CLIENT_INSTALL_PATH: join(homedir(), ".steam/steam"),
+  };
+
+  // Unzip
+  const extractDir = join(DOWNLOAD_DIR, "install-" + upid.slice(0, 8));
+  mkdirSync(extractDir, { recursive: true });
+  log("info", `Unzipping ${filename}...`);
+  execSync(`unzip -o "${zipPath}" -d "${extractDir}"`, { timeout: 120000 });
+
+  // Find .exe installer
+  const { readdirSync } = await import("fs");
+  const files = readdirSync(extractDir);
+  const exeFile = files.find(f => f.endsWith(".exe") && !f.toLowerCase().includes("uninstall"));
+  if (!exeFile) { log("error", "No .exe found in zip"); throw new Error("No .exe in zip"); }
+
+  const exePath = join(extractDir, exeFile);
+  log("info", `Running installer: ${exeFile} via Proton...`);
+
+  // Run installer via Proton (GUI mode — user clicks through)
+  return new Promise((resolve, reject) => {
+    log("info", "Launching installer GUI — user needs to click through the install wizard");
+    const child = exec(
+      `"${protonPath}" run "${exePath}"`,
+      { env, timeout: 600000 },
+      (error, stdout, stderr) => {
+        if (error && error.code !== 0) {
+          log("warn", `Installer exited with code ${error.code} (may be OK)`);
+        }
+        log("info", `Installer finished: ${exeFile}`);
+
+        // Run yabridge sync
+        try {
+          const vst3Dir = join(compatPath, "pfx/drive_c/Program Files/Common Files/VST3");
+          if (existsSync(vst3Dir)) {
+            log("info", "Running yabridgectl sync...");
+            execSync(`yabridgectl add "${vst3Dir}" 2>/dev/null; WINEPREFIX="${join(compatPath, "pfx")}" yabridgectl sync 2>/dev/null`, { timeout: 30000 });
+            log("info", "yabridge sync complete");
+          }
+        } catch (e) {
+          log("warn", `yabridge sync: ${e.message}`);
+        }
+
+        // Cleanup extract dir
+        execSync(`rm -rf "${extractDir}"`);
+        resolve();
+      }
+    );
+  });
 }
 
 function handleRefreshProductList() {
@@ -467,6 +564,12 @@ async function handleRequest(raw) {
   if (fieldNums.has(67)) return handleKompleteHdds();
   if (fieldNums.has(87)) return handleRefreshProductList();
   if (fieldNums.has(91)) return handleStartDeployments(fields);
+
+  // Handle pause/resume/cancel requests gracefully
+  if (fieldNums.has(15) || fieldNums.has(16) || fieldNums.has(17)) {
+    log("info", `pause/resume/cancel request (fields: ${[...fieldNums]})`);
+    return buildResponse(3); // success
+  }
 
   log("info", `Unknown request (fields: ${[...fieldNums]})`);
   return buildResponse(3);
