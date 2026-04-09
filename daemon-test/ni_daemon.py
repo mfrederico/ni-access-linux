@@ -193,6 +193,8 @@ def identify_request(fields):
         return "getPreferencesRequest"
     if WIRE_KNOWN_PRODUCTS_REQUEST in field_nums:
         return "knownProductsRequest"
+    if 42 in field_nums:
+        return "userInfoRequest"
     if FIELD_LOGIN_REQUEST in field_nums:
         return "loginRequest"
     if FIELD_LOGOUT_REQUEST in field_nums:
@@ -305,9 +307,10 @@ def handle_auth0_login(fields):
                 except Exception as pe:
                     log.error(f"Failed to publish login event: {pe}")
 
-            # Store tokens for later
+            # Store tokens for later and persist to disk
             global stored_tokens
             stored_tokens = token_data
+            save_tokens()
 
             # Return auth0AccessTokenResponse (field 34)
             header = build_header()
@@ -326,8 +329,27 @@ def handle_auth0_login(fields):
     return encode_field(FIELD_HEADER, 2, header) + encode_field(3, 2, b"")  # successResponse
 
 
-# Stored auth tokens
+# Stored auth tokens — persist to disk
+DAEMON_TOKEN_FILE = os.path.expanduser("~/.ni-daemon-tokens.json")
 stored_tokens = {}
+
+def save_tokens():
+    try:
+        with open(DAEMON_TOKEN_FILE, 'w') as f:
+            json.dump(stored_tokens, f)
+        log.info(f"Tokens saved to {DAEMON_TOKEN_FILE}")
+    except Exception as e:
+        log.error(f"Failed to save tokens: {e}")
+
+def load_tokens():
+    global stored_tokens
+    try:
+        if os.path.exists(DAEMON_TOKEN_FILE):
+            with open(DAEMON_TOKEN_FILE) as f:
+                stored_tokens = json.load(f)
+            log.info(f"Loaded stored tokens (access_token: {len(stored_tokens.get('access_token',''))} chars)")
+    except Exception as e:
+        log.error(f"Failed to load tokens: {e}")
 
 
 def handle_auth0_access_token():
@@ -350,14 +372,43 @@ def handle_auth0_access_token():
 def handle_get_preferences():
     """Return default preferences."""
     header = build_header()
-    # Preferences response: return sensible defaults
-    # Field structure from JS: downloadLocation (string), contentLocation (string)
-    import os
-    prefs_body = (
-        encode_field(1, 2, os.path.expanduser("~/NI-Downloads")) +  # downloadLocation
-        encode_field(2, 2, os.path.expanduser("~/NI-Instruments"))  # contentLocation
-    )
+    # PreferencesResponse has field 1 = Preferences message (nested)
+    # Return empty preferences (valid but no data)
+    prefs_body = encode_field(1, 2, b"")  # empty nested Preferences message
     return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_GET_PREFERENCES_RESPONSE, 2, prefs_body)
+
+
+def handle_user_info():
+    """Return user info from the stored token."""
+    header = build_header()
+    # UserInfoResponse (field 43, tag 346): has fields for user details
+    # Field 1 = nativeId (string), field 2 = email (string), field 3 = firstName, field 4 = lastName
+    # Get user info from the stored id_token or from the API
+    try:
+        import requests as http_requests
+        access_token = stored_tokens.get("access_token", "")
+        if access_token:
+            resp = http_requests.get(
+                "https://auth.native-instruments.com/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10,
+            )
+            user = resp.json()
+            native_id = user.get("native_id", user.get("sub", ""))
+            email = user.get("email", "")
+            nickname = user.get("nickname", "")
+            log.info(f"User info: {email} (native_id: {native_id})")
+
+            user_body = (
+                encode_field(1, 2, native_id) +
+                encode_field(2, 2, email) +
+                encode_field(3, 2, nickname)
+            )
+            return encode_field(FIELD_HEADER, 2, header) + encode_field(43, 2, user_body)
+    except Exception as e:
+        log.error(f"Failed to get user info: {e}")
+
+    return encode_field(FIELD_HEADER, 2, header) + encode_field(3, 2, b"")
 
 
 def handle_known_products():
@@ -405,6 +456,8 @@ def run_req_server(context):
                     response = handle_auth0_access_token()
                 elif request_type == "getPreferencesRequest":
                     response = handle_get_preferences()
+                elif request_type == "userInfoRequest":
+                    response = handle_user_info()
                 elif request_type == "knownProductsRequest":
                     response = handle_known_products()
                 elif request_type == "isLoggedInRequest":
@@ -461,6 +514,9 @@ def main():
     log.info(f"REQ/REP port: {REQ_PORT}")
     log.info(f"PUB port: {PUB_PORT}")
     log.info("=" * 60)
+
+    # Load previously stored tokens
+    load_tokens()
 
     context = zmq.Context()
 
