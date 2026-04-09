@@ -19,6 +19,7 @@ import time
 import signal
 import logging
 import struct
+import subprocess
 import threading
 
 try:
@@ -82,6 +83,12 @@ def encode_field(field_number, wire_type, value):
         if isinstance(value, str):
             value = value.encode('utf-8')
         return tag + encode_varint(len(value)) + value
+    elif wire_type == 5:  # 32-bit (float)
+        if isinstance(value, float):
+            return tag + struct.pack('<f', value)
+        return tag + value  # already packed bytes
+    elif wire_type == 1:  # 64-bit
+        return tag + struct.pack('<Q', value)
     return tag
 
 def decode_fields(data):
@@ -201,6 +208,8 @@ def identify_request(fields):
         return "subscriptionsRequest"
     if 87 in field_nums:
         return "refreshProductListRequest"
+    if 91 in field_nums:
+        return "startDeploymentsRequest"
     if 67 in field_nums:
         return "currentKompleteHddsRequest"
     if FIELD_LOGIN_REQUEST in field_nums:
@@ -541,6 +550,192 @@ def handle_known_products():
         return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_KNOWN_PRODUCTS_RESPONSE, 2, b"")
 
 
+def handle_start_deployments(fields):
+    """Handle download/install request from Native Access."""
+    # Parse the deployments from field 91
+    deployments = []
+    for fnum, wtype, val in fields:
+        if fnum == 91 and isinstance(val, bytes):
+            inner = decode_fields(val)
+            for ifnum, iwtype, ival in inner:
+                if ifnum == 1 and isinstance(ival, bytes):
+                    dep_fields = decode_fields(ival)
+                    upid = ""
+                    dep_type = 0
+                    for df, dw, dv in dep_fields:
+                        if df == 1 and isinstance(dv, bytes):
+                            upid = dv.decode('utf-8', errors='replace')
+                        elif df == 2:
+                            dep_type = dv
+                    if upid:
+                        deployments.append({"upid": upid, "type": dep_type})
+
+    log.info(f"startDeploymentsRequest: {len(deployments)} deployments")
+    for d in deployments:
+        log.info(f"  Deploy: upid={d['upid'][:16]}... type={d['type']}")
+
+    # Return success response (field 92)
+    header = build_header()
+    response = encode_field(FIELD_HEADER, 2, header) + encode_field(92, 2, b"")
+
+    # Start downloads in background
+    if deployments:
+        threading.Thread(target=_process_deployments, args=(deployments,), daemon=True).start()
+
+    return response
+
+
+def _process_deployments(deployments):
+    """Background thread to download and install products."""
+    import requests as http_requests
+    import uuid
+    import xml.etree.ElementTree as ET
+
+    access_token = stored_tokens.get("access_token", "")
+    app_token = (
+        "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9."
+        "eyJpYXQiOjE2MzQ3MzA1MjYsInN1YiI6ImFwcGxpY2F0aW9uIiwiZGF0YSI6eyJuYW1lIjoiTmF0aXZlQWNjZXNzIiwidmVyc2lvbiI6IjIuMCJ9LCJleHAiOjI1MzQwMjMwMDc5OX0."
+        "U6EQdp8WNcOyYFIHWw9tGUDUCEtxSuLmqEOfLB2UCZMYUkmsV5TItuKPbPCg5-_s7Ls3_4vbMDpisfGqXretddhVnBg-UoSJB4vj4RZtZq29_KaSly9cFA2A5lVbCDEM1bKNkKfNSyfDM6Whkdu2ub3aqt3LgAg7dfMVI3-_MY24txhZNW8xQ44M1nVsiUkpMk7nqrhIwcnb7EX-DPLbIQQ2NCLtoEGiA9eeCu19RvekxTxbttghDptkFBYqs_6CTiKmg98BkU8kQn2225LuzLIeD43vA6yHGyPwyvZloO1Pid5TcRH5qjqjLcfnCk65lSEGR39fZY_AnuDQAtF4tg"
+    )
+    download_dir = os.path.expanduser("~/NI-Downloads")
+    os.makedirs(download_dir, exist_ok=True)
+
+    # Get all available artifacts
+    try:
+        resp = http_requests.get(
+            "https://api.native-instruments.com/v2/download/me/full-products",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "X-NI-App-Token": app_token,
+                "Accept": "application/json",
+                "User-Agent": "NativeAccess/3.24.0",
+            },
+            timeout=30,
+        )
+        all_artifacts = resp.json().get("artifacts", [])
+    except Exception as e:
+        log.error(f"Failed to fetch artifacts: {e}")
+        return
+
+    for dep in deployments:
+        upid = dep["upid"]
+        deployment_id = str(uuid.uuid4())
+
+        # Find the best artifact for this product (prefer linux, then pc)
+        matching = [a for a in all_artifacts if a["upid"] == upid]
+        artifact = None
+        for prefer in ["linux", "nativeos", "pc", "all"]:
+            for a in matching:
+                if a.get("platform", "") == prefer or prefer in a.get("platform", ""):
+                    if not artifact or a.get("version", "") > artifact.get("version", ""):
+                        artifact = a
+            if artifact:
+                break
+        if not artifact and matching:
+            artifact = matching[0]
+
+        if not artifact:
+            log.error(f"No artifact found for {upid}")
+            continue
+
+        filename = artifact.get("target_file", f"{upid}.bin")
+        update_id = artifact.get("update_id", "")
+        log.info(f"Downloading {filename} for {upid} (update_id={update_id[:16]}...)")
+
+        # Publish downloadStartedEvent (field 20)
+        if pub_socket:
+            event_body = encode_field(1, 2, deployment_id) + encode_field(2, 2, upid)
+            event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(20, 2, event_body)
+            pub_socket.send_multipart([b"daemon/event", event])
+            log.info(f"Published downloadStartedEvent for {filename}")
+
+        # Get download URL
+        try:
+            dl_resp = http_requests.get(
+                f"https://api.native-instruments.com/v2/download/links/{upid}/{update_id}",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-NI-App-Token": app_token,
+                    "User-Agent": "NativeAccess/3.24.0",
+                },
+                timeout=15,
+            )
+            # Parse metalink XML
+            root = ET.fromstring(dl_resp.text)
+            ns = {"ml": "urn:ietf:params:xml:ns:metalink"}
+            cdn_url = root.find(".//ml:url", ns).text
+        except Exception as e:
+            log.error(f"Failed to get download URL for {upid}: {e}")
+            continue
+
+        # Download the file
+        dest = os.path.join(download_dir, filename)
+        try:
+            r = http_requests.get(cdn_url, stream=True, timeout=30)
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", artifact.get("filesize", 0)))
+            downloaded = 0
+
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        progress = downloaded / total
+                        # Publish downloadProgressedEvent (field 21) every ~5%
+                        if pub_socket and int(progress * 20) > int((downloaded - len(chunk)) / total * 20):
+                            prog_body = (
+                                encode_field(1, 2, deployment_id) +
+                                encode_field(2, 5, struct.pack('<f', progress)) +  # float, wire type 5
+                                encode_field(3, 2, upid)
+                            )
+                            event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(21, 2, prog_body)
+                            pub_socket.send_multipart([b"daemon/event", event])
+                            log.info(f"Download progress: {filename} {progress*100:.0f}%")
+
+            log.info(f"Download complete: {dest} ({downloaded} bytes)")
+
+            # Publish downloadSucceededEvent (field 23)
+            if pub_socket:
+                event_body = encode_field(1, 2, deployment_id) + encode_field(2, 2, upid)
+                event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(23, 2, event_body)
+                pub_socket.send_multipart([b"daemon/event", event])
+                log.info(f"Published downloadSucceededEvent for {filename}")
+
+            # Publish installationStartedEvent (field 24)
+            if pub_socket:
+                event_body = encode_field(1, 2, deployment_id) + encode_field(2, 2, upid)
+                event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(24, 2, event_body)
+                pub_socket.send_multipart([b"daemon/event", event])
+
+            # Auto-install .deb files
+            if filename.endswith(".deb"):
+                log.info(f"Installing {filename}...")
+                result = subprocess.run(
+                    ["sudo", "dpkg", "--force-depends", "-i", dest],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode == 0:
+                    log.info(f"Installed {filename} successfully")
+                else:
+                    log.error(f"Install failed: {result.stderr}")
+
+            # Publish installationSucceededEvent (field 26)
+            if pub_socket:
+                event_body = encode_field(1, 2, deployment_id) + encode_field(2, 2, upid)
+                event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(26, 2, event_body)
+                pub_socket.send_multipart([b"daemon/event", event])
+                log.info(f"Published installationSucceededEvent for {filename}")
+
+        except Exception as e:
+            log.error(f"Download failed for {filename}: {e}")
+            # Publish downloadFailedEvent (field 22)
+            if pub_socket:
+                event_body = encode_field(1, 2, deployment_id) + encode_field(2, 2, upid)
+                event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(22, 2, event_body)
+                pub_socket.send_multipart([b"daemon/event", event])
+
+
 def handle_unknown(request_type, raw_data):
     """Handle unknown requests with a success response."""
     log.info(f"Unknown request: {request_type}, data hex: {raw_data[:100].hex()}")
@@ -602,6 +797,8 @@ def run_req_server(context):
                             except Exception as e:
                                 log.error(f"Failed to publish: {e}")
                         threading.Thread(target=_publish_refresh, daemon=True).start()
+                elif request_type == "startDeploymentsRequest":
+                    response = handle_start_deployments(fields)
                 elif request_type == "subscriptionsRequest":
                     header = build_header()
                     response = encode_field(FIELD_HEADER, 2, header) + encode_field(78, 2, b"")
