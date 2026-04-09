@@ -1,13 +1,19 @@
 #!/bin/bash
 # Kill old processes and restart daemon + Native Access
-# Run this after making changes to ni_daemon.py
 
-pkill -9 -f ni_daemon.py 2>/dev/null
+pkill -9 -f ni_daemon 2>/dev/null
 pkill -9 -f "electron.*app.asar" 2>/dev/null
 sleep 2
 
-# Start daemon
-python3 ~/Downloads/ni-access-linux/daemon-test/ni_daemon.py > /tmp/ni-daemon-test.log 2>&1 &
+# Start Node.js daemon
+cd "$(dirname "$0")"
+if [ -f ni_daemon.mjs ]; then
+    node ni_daemon.mjs > /tmp/ni-daemon-test.log 2>&1 &
+    echo "Started Node.js daemon"
+else
+    python3 ni_daemon.py > /tmp/ni-daemon-test.log 2>&1 &
+    echo "Started Python daemon"
+fi
 sleep 2
 
 if ss -tlnp | grep -q 5146; then
@@ -26,4 +32,4 @@ echo "=== Daemon log ==="
 tail -20 /tmp/ni-daemon-test.log
 echo ""
 echo "=== NA log (key lines) ==="
-grep -iE "version|daemon|deploy|login|error|success|initialized" ~/.local/share/Electron/logs/native-access.log 2>/dev/null | tail -20
+grep -iE "version|daemon|deploy|login|error|success|initialized|subscriber|STARTUP|Heartbeat" ~/.local/share/Electron/logs/native-access.log 2>/dev/null | tail -20
