@@ -129,10 +129,15 @@ async function httpText(url, headers = {}) {
 // ============================================================================
 // PUB helpers
 // ============================================================================
-function publishEvent(fieldNum, body = Buffer.alloc(0)) {
+async function publishEvent(fieldNum, body = Buffer.alloc(0)) {
   if (!pub) return;
   const msg = buildResponse(fieldNum, body);
-  pub.send(["", msg]);
+  try {
+    await pub.send(["", msg]);
+    log("debug", `PUB sent field ${fieldNum} (${msg.length} bytes)`);
+  } catch (e) {
+    log("error", `PUB send failed field ${fieldNum}: ${e.message}`);
+  }
 }
 
 // ============================================================================
@@ -275,7 +280,8 @@ async function handleKnownProducts() {
       entries = Buffer.concat([entries, encodeField(1, 2, product)]);
     }
 
-    publishEvent(85); // productListRefreshedEvent
+    // Don't publish productListRefreshedEvent here — it causes an infinite loop
+    // The event should only be published after refreshProductListRequest
     return buildResponse(48, entries);
   } catch (e) { log("error", `KnownProducts error: ${e.message}`); }
   return buildResponse(48);
@@ -296,12 +302,29 @@ async function handleStartDeployments(fields) {
   }
   log("info", `startDeploymentsRequest: ${deployments.length} deployments`);
 
-  // Start downloads in background
-  processDeployments(deployments);
-  return buildResponse(92);
+  // Generate deployment IDs and build response with results
+  const deploymentsWithIds = [];
+  let resultsBody = Buffer.alloc(0);
+  for (const upid of deployments) {
+    const deploymentId = crypto.randomUUID();
+    deploymentsWithIds.push({ upid, deploymentId });
+    // DeploymentResult: upid (field 1), type (field 2), deploymentId (field 3)
+    const result = Buffer.concat([
+      encodeField(1, 2, upid),
+      encodeField(2, 0, 1), // DEPLOYMENT_TYPE_FULL
+      encodeField(3, 2, deploymentId),
+    ]);
+    resultsBody = Buffer.concat([resultsBody, encodeField(1, 2, result)]);
+  }
+
+  // Start downloads in background — events published from there
+  processDeployments(deploymentsWithIds);
+
+  // Return response with deployment results
+  return buildResponse(92, resultsBody);
 }
 
-async function processDeployments(upids) {
+async function processDeployments(deploymentsWithIds) {
   const token = storedTokens.access_token;
   if (!token) return;
   mkdirSync(DOWNLOAD_DIR, { recursive: true });
@@ -310,8 +333,7 @@ async function processDeployments(upids) {
   const artifactsData = await httpJson("https://api.native-instruments.com/v2/download/me/full-products", { headers });
   const allArtifacts = artifactsData.artifacts || [];
 
-  for (const upid of upids) {
-    const deploymentId = crypto.randomUUID();
+  for (const { upid, deploymentId } of deploymentsWithIds) {
     const matching = allArtifacts.filter(a => a.upid === upid);
     let artifact = null;
     for (const pref of ["linux", "nativeos", "pc", "all"]) {
@@ -325,10 +347,10 @@ async function processDeployments(upids) {
     const updateId = artifact.update_id;
     log("info", `Downloading ${filename}...`);
 
-    // Publish enqueued + started
     const evBody = Buffer.concat([encodeField(1, 2, deploymentId), encodeField(2, 2, upid)]);
-    publishEvent(57, evBody); // downloadEnqueuedEvent
-    publishEvent(20, evBody); // downloadStartedEvent
+    await publishEvent(57, evBody); // downloadEnqueuedEvent
+    await publishEvent(90);         // downloadQueueChangedEvent
+    await publishEvent(20, evBody); // downloadStartedEvent
 
     try {
       const mlText = await httpText(
