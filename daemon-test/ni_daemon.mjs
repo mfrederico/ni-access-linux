@@ -21,6 +21,8 @@ const APP_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpYXQiOjE2MzQ3MzA1MjYs
 
 let storedTokens = {};
 let pub = null;
+// Track active deployments for progress reporting
+const activeDeployments = new Map(); // deploymentId -> { upid, title, progress, state }
 
 // ============================================================================
 // Protobuf helpers
@@ -165,8 +167,23 @@ function handleSetPreferences() {
 }
 
 function handleActiveDeployments() {
-  log("info", "activeDeploymentsRequest");
-  return buildResponse(74);
+  log("info", `activeDeploymentsRequest (${activeDeployments.size} active)`);
+  if (activeDeployments.size === 0) return buildResponse(74);
+
+  // Build ActiveDeployment entries
+  // state: 0=UNSPECIFIED, 1=QUEUED, 2=DOWNLOADING, 3=INSTALLING, 4=COMPLETED
+  let entries = Buffer.alloc(0);
+  for (const [deploymentId, dep] of activeDeployments) {
+    const entry = Buffer.concat([
+      encodeField(1, 2, deploymentId),
+      encodeField(2, 2, dep.upid),
+      encodeField(3, 2, dep.title || ""),
+      encodeField(4, 5, dep.progress || 0),
+      encodeField(5, 0, dep.state || 2), // DOWNLOADING
+    ]);
+    entries = Buffer.concat([entries, encodeField(1, 2, entry)]);
+  }
+  return buildResponse(74, entries);
 }
 
 function handleSubscriptions() {
@@ -348,8 +365,14 @@ async function processDeployments(deploymentsWithIds) {
     log("info", `Downloading ${filename}...`);
 
     const evBody = Buffer.concat([encodeField(1, 2, deploymentId), encodeField(2, 2, upid)]);
+
+    // Track this deployment
+    activeDeployments.set(deploymentId, { upid, title: artifact.product_title || filename, progress: 0, state: 1 });
+
     await publishEvent(57, evBody); // downloadEnqueuedEvent
     await publishEvent(90);         // downloadQueueChangedEvent
+
+    activeDeployments.get(deploymentId).state = 2; // DOWNLOADING
     await publishEvent(20, evBody); // downloadStartedEvent
 
     try {
@@ -381,15 +404,27 @@ async function processDeployments(deploymentsWithIds) {
             encodeField(3, 2, upid),
           ]);
           publishEvent(21, progBody); // downloadProgressedEvent
+          // Update tracked state
+          const dep = activeDeployments.get(deploymentId);
+          if (dep) dep.progress = pct;
           log("info", `${filename}: ${Math.round(pct * 100)}%`);
         }
       }
       fileHandle.end();
       log("info", `Downloaded: ${dest} (${downloaded} bytes)`);
 
-      publishEvent(23, evBody); // downloadSucceededEvent
-      publishEvent(24, evBody); // installationStartedEvent
-      publishEvent(26, evBody); // installationSucceededEvent
+      await publishEvent(23, evBody); // downloadSucceededEvent
+
+      const dep = activeDeployments.get(deploymentId);
+      if (dep) dep.state = 3; // INSTALLING
+      await publishEvent(24, evBody); // installationStartedEvent
+
+      if (dep) dep.state = 4; // COMPLETED
+      await publishEvent(26, evBody); // installationSucceededEvent
+
+      // Remove from active deployments
+      activeDeployments.delete(deploymentId);
+      await publishEvent(90); // downloadQueueChangedEvent
       log("info", `Completed: ${filename}`);
     } catch (e) {
       log("error", `Download failed: ${e.message}`);
