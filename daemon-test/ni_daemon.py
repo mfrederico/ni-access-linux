@@ -167,6 +167,13 @@ WIRE_DAEMON_VERSION_REQUEST = 71
 WIRE_DAEMON_VERSION_RESPONSE = 72
 WIRE_ACTIVE_DEPLOYMENTS_REQUEST = 73
 WIRE_ACTIVE_DEPLOYMENTS_RESPONSE = 74
+WIRE_AUTH0_LOGIN_REQUEST = 32
+WIRE_AUTH0_ACCESS_TOKEN_REQUEST = 33
+WIRE_AUTH0_ACCESS_TOKEN_RESPONSE = 34
+WIRE_GET_PREFERENCES_REQUEST = 49
+WIRE_GET_PREFERENCES_RESPONSE = 50
+WIRE_KNOWN_PRODUCTS_REQUEST = 47
+WIRE_KNOWN_PRODUCTS_RESPONSE = 48
 
 def identify_request(fields):
     """Identify what type of request this is based on field numbers."""
@@ -178,6 +185,14 @@ def identify_request(fields):
         return "daemonVersionRequest"
     if WIRE_ACTIVE_DEPLOYMENTS_REQUEST in field_nums:
         return "activeDeploymentsRequest"
+    if WIRE_AUTH0_LOGIN_REQUEST in field_nums:
+        return "auth0LoginRequest"
+    if WIRE_AUTH0_ACCESS_TOKEN_REQUEST in field_nums:
+        return "auth0AccessTokenRequest"
+    if WIRE_GET_PREFERENCES_REQUEST in field_nums:
+        return "getPreferencesRequest"
+    if WIRE_KNOWN_PRODUCTS_REQUEST in field_nums:
+        return "knownProductsRequest"
     if FIELD_LOGIN_REQUEST in field_nums:
         return "loginRequest"
     if FIELD_LOGOUT_REQUEST in field_nums:
@@ -235,6 +250,122 @@ def handle_active_deployments():
     return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_ACTIVE_DEPLOYMENTS_RESPONSE, 2, deployments_body)
 
 
+def handle_auth0_login(fields):
+    """Handle auth0 login — exchange PKCE code for tokens."""
+    # Extract the auth code, redirect URI, and code verifier from field 32
+    login_data = None
+    for fnum, wtype, val in fields:
+        if fnum == WIRE_AUTH0_LOGIN_REQUEST and isinstance(val, bytes):
+            inner = decode_fields(val)
+            auth_code = ""
+            redirect_uri = ""
+            code_verifier = ""
+            for ifnum, iwtype, ival in inner:
+                if ifnum == 1 and isinstance(ival, bytes):
+                    auth_code = ival.decode('utf-8', errors='replace')
+                elif ifnum == 2 and isinstance(ival, bytes):
+                    redirect_uri = ival.decode('utf-8', errors='replace')
+                elif ifnum == 3 and isinstance(ival, bytes):
+                    code_verifier = ival.decode('utf-8', errors='replace')
+            login_data = (auth_code, redirect_uri, code_verifier)
+
+    if not login_data:
+        log.error("Could not parse auth0LoginRequest")
+        return handle_unknown("auth0LoginRequest", b"")
+
+    auth_code, redirect_uri, code_verifier = login_data
+    log.info(f"Auth0 login: code={auth_code[:20]}... redirect={redirect_uri} verifier={code_verifier[:20]}...")
+
+    # Exchange the code for tokens
+    try:
+        import requests as http_requests
+        resp = http_requests.post(
+            f"https://auth.native-instruments.com/oauth/token",
+            json={
+                "grant_type": "authorization_code",
+                "client_id": "GgcQZ2OCSvzqgVL7RSAoErQRNB9S59kh",
+                "code": auth_code,
+                "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
+            },
+            timeout=15,
+        )
+        token_data = resp.json()
+        if "access_token" in token_data:
+            log.info("Auth0 token exchange successful!")
+            access_token = token_data["access_token"]
+            id_token = token_data.get("id_token", "")
+
+            # Publish userLoggedInEvent on PUB socket (field 69, tag 554)
+            if pub_socket:
+                try:
+                    event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(69, 2, b"")
+                    pub_socket.send(event)
+                    log.info("Published userLoggedInEvent")
+                except Exception as pe:
+                    log.error(f"Failed to publish login event: {pe}")
+
+            # Store tokens for later
+            global stored_tokens
+            stored_tokens = token_data
+
+            # Return auth0AccessTokenResponse (field 34)
+            header = build_header()
+            token_body = (
+                encode_field(1, 2, access_token) +
+                encode_field(2, 2, id_token)
+            )
+            return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_AUTH0_ACCESS_TOKEN_RESPONSE, 2, token_body)
+        else:
+            log.error(f"Token exchange failed: {token_data}")
+    except Exception as e:
+        log.error(f"Token exchange error: {e}")
+
+    # Return success anyway to not block the flow
+    header = build_header()
+    return encode_field(FIELD_HEADER, 2, header) + encode_field(3, 2, b"")  # successResponse
+
+
+# Stored auth tokens
+stored_tokens = {}
+
+
+def handle_auth0_access_token():
+    """Return stored access token."""
+    header = build_header()
+    access_token = stored_tokens.get("access_token", "")
+    id_token = stored_tokens.get("id_token", "")
+
+    if access_token:
+        token_body = (
+            encode_field(1, 2, access_token) +
+            encode_field(2, 2, id_token)
+        )
+        return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_AUTH0_ACCESS_TOKEN_RESPONSE, 2, token_body)
+
+    # No tokens stored — return empty
+    return encode_field(FIELD_HEADER, 2, header) + encode_field(3, 2, b"")
+
+
+def handle_get_preferences():
+    """Return default preferences."""
+    header = build_header()
+    # Preferences response: return sensible defaults
+    # Field structure from JS: downloadLocation (string), contentLocation (string)
+    import os
+    prefs_body = (
+        encode_field(1, 2, os.path.expanduser("~/NI-Downloads")) +  # downloadLocation
+        encode_field(2, 2, os.path.expanduser("~/NI-Instruments"))  # contentLocation
+    )
+    return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_GET_PREFERENCES_RESPONSE, 2, prefs_body)
+
+
+def handle_known_products():
+    """Return empty known products list."""
+    header = build_header()
+    return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_KNOWN_PRODUCTS_RESPONSE, 2, b"")
+
+
 def handle_unknown(request_type, raw_data):
     """Handle unknown requests with a success response."""
     log.info(f"Unknown request: {request_type}, data hex: {raw_data[:100].hex()}")
@@ -268,6 +399,14 @@ def run_req_server(context):
                     response = handle_version_request()
                 elif request_type == "activeDeploymentsRequest":
                     response = handle_active_deployments()
+                elif request_type == "auth0LoginRequest":
+                    response = handle_auth0_login(fields)
+                elif request_type == "auth0AccessTokenRequest":
+                    response = handle_auth0_access_token()
+                elif request_type == "getPreferencesRequest":
+                    response = handle_get_preferences()
+                elif request_type == "knownProductsRequest":
+                    response = handle_known_products()
                 elif request_type == "isLoggedInRequest":
                     response = handle_is_logged_in()
                 else:
@@ -288,10 +427,14 @@ def run_req_server(context):
             log.error(f"Server error: {e}")
 
 
+pub_socket = None
+
 def run_pub_server(context):
     """PUB server — publishes events to plugins."""
+    global pub_socket
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://127.0.0.1:{PUB_PORT}")
+    pub_socket = socket
     log.info(f"PUB server listening on tcp://127.0.0.1:{PUB_PORT}")
 
     # Periodically publish heartbeat events
