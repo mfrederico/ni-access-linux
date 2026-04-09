@@ -353,9 +353,13 @@ async function processDeployments(deploymentsWithIds) {
   for (const { upid, deploymentId } of deploymentsWithIds) {
     const matching = allArtifacts.filter(a => a.upid === upid);
     let artifact = null;
-    for (const pref of ["linux", "nativeos", "pc", "all"]) {
-      artifact = matching.find(a => a.platform?.includes(pref));
-      if (artifact) break;
+    // Prefer PC (Windows) installers — they have full GUI via yabridge
+    // Native Linux .deb builds are headless (no GUI)
+    for (const pref of ["pc", "all", "nativeos", "linux"]) {
+      const candidates = matching
+        .filter(a => a.platform?.includes(pref))
+        .sort((a, b) => (b.version || "").localeCompare(a.version || ""));
+      if (candidates.length) { artifact = candidates[0]; break; }
     }
     if (!artifact) artifact = matching[0];
     if (!artifact) { log("error", `No artifact for ${upid}`); continue; }
@@ -398,15 +402,16 @@ async function processDeployments(deploymentsWithIds) {
         const pct = total > 0 ? downloaded / total : 0;
         if (Math.floor(pct * 20) > lastPct) {
           lastPct = Math.floor(pct * 20);
+          const pct100 = pct * 100;
           const progBody = Buffer.concat([
             encodeField(1, 2, deploymentId),
-            encodeField(2, 5, pct),
+            encodeField(2, 5, pct100),
             encodeField(3, 2, upid),
           ]);
           publishEvent(21, progBody); // downloadProgressedEvent
           // Update tracked state
           const dep = activeDeployments.get(deploymentId);
-          if (dep) dep.progress = pct;
+          if (dep) dep.progress = pct100;
           log("info", `${filename}: ${Math.round(pct * 100)}%`);
         }
       }
