@@ -214,9 +214,11 @@ def identify_request(fields):
 
 
 def build_header(request_id=b""):
-    """Build a response header."""
-    # Header has field 1 = request_id (string)
-    return encode_field(1, 2, request_id)
+    """Build a response header with protocol version."""
+    # Header: field 1 = Version message, field 2 = taskId
+    # Version: field 1 = major (8), field 3 = micro (1) — matches request protocol
+    version = encode_field(1, 0, 8) + encode_field(3, 0, 1)
+    return encode_field(1, 2, version)
 
 
 def handle_ping():
@@ -310,7 +312,7 @@ def handle_auth0_login(fields):
             if pub_socket:
                 try:
                     event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(69, 2, b"")
-                    pub_socket.send(event)
+                    pub_socket.send_multipart([b"daemon/event", event])
                     log.info("Published userLoggedInEvent")
                 except Exception as pe:
                     log.error(f"Failed to publish login event: {pe}")
@@ -458,35 +460,64 @@ def handle_known_products():
         products = data.get("response_body", {}).get("products", [])
         log.info(f"Fetched {len(products)} products from NI API")
 
-        # Look up product names
+        # Get download artifacts which have product titles
+        artifacts_resp = http_requests.get(
+            "https://api.native-instruments.com/v2/download/me/full-products",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "X-NI-App-Token": app_token,
+                "Accept": "application/json",
+                "User-Agent": "NativeAccess/3.24.0",
+            },
+            timeout=30,
+        )
+        all_artifacts = artifacts_resp.json().get("artifacts", [])
+        # Build UPID -> title map from artifacts
+        upid_titles = {}
+        for a in all_artifacts:
+            uid = a.get("upid", "")
+            if uid and uid not in upid_titles:
+                upid_titles[uid] = a.get("product_title", uid[:8])
+        log.info(f"Resolved {len(upid_titles)} product titles from artifacts")
+
         product_entries = b""
         for p in products:
             upid = p.get("upid", "")
-            # Get product name
-            try:
-                name_resp = http_requests.get(
-                    f"https://api.native-instruments.com/v1/products/{upid}",
-                    headers={"Authorization": f"Bearer {app_token}", "Accept": "application/json", "User-Agent": "NativeAccess/3.24.0"},
-                    timeout=10,
-                )
-                name_data = name_resp.json()
-                resources = name_data.get("response_body", {}).get("resources", [])
-                title = next((r["value"] for r in resources if r["key"] == "name"), upid[:8])
-            except:
-                title = upid[:8]
+            title = upid_titles.get(upid, upid[:8])
 
             # Build KnownProduct protobuf
-            # field 1 = upid (string), field 3 = title (string)
-            # field 11 = activationState (int32, 1=activated), field 12 = isOwned (bool)
+            # field 1 = upid (string)
+            # field 2 = isPlayer (bool)
+            # field 3 = title (string)
+            # field 7 = installed (bool)
+            # field 8 = updateable (bool)
+            # field 11 = activationState (int32, 1=ACTIVATED)
+            # field 12 = isOwned (bool)
+            # field 14 = isLocatable (bool)
+            # field 15 = isInstallable (bool)
+            # field 19 = type (int32)
+            # field 20 = isUninstallable (bool)
             product_pb = (
-                encode_field(1, 2, upid) +     # upid
-                encode_field(3, 2, title) +    # title
-                encode_field(11, 0, 1) +       # activationState = ACTIVATED
-                encode_field(12, 0, 1)         # isOwned = true
+                encode_field(1, 2, upid) +      # upid
+                encode_field(3, 2, title) +     # title
+                encode_field(7, 0, 0) +         # installed = false (not yet installed)
+                encode_field(11, 0, 1) +        # activationState = ACTIVATED
+                encode_field(12, 0, 1) +        # isOwned = true
+                encode_field(15, 0, 1)          # isInstallable = true
             )
             product_entries += encode_field(1, 2, product_pb)
 
         log.info(f"Built knownProductsResponse with {len(products)} products")
+
+        # Publish productListRefreshedEvent on PUB socket (field 85, tag 682)
+        if pub_socket:
+            try:
+                event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(85, 2, b"")
+                pub_socket.send(event)
+                log.info("Published productListRefreshedEvent")
+            except Exception as pe:
+                log.error(f"Failed to publish product event: {pe}")
+
         return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_KNOWN_PRODUCTS_RESPONSE, 2, product_entries)
 
     except Exception as e:
@@ -541,8 +572,20 @@ def run_req_server(context):
                     header = build_header()
                     response = encode_field(FIELD_HEADER, 2, header) + encode_field(52, 2, b"")
                 elif request_type == "refreshProductListRequest":
-                    # Return known products again
-                    response = handle_known_products()
+                    # Respond with success, then publish productListRefreshedEvent
+                    header = build_header()
+                    response = encode_field(FIELD_HEADER, 2, header) + encode_field(3, 2, b"")
+                    # Publish event after a short delay
+                    if pub_socket:
+                        def _publish_refresh():
+                            time.sleep(1)
+                            try:
+                                event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(85, 2, b"")
+                                pub_socket.send_multipart([b"daemon/event", event])
+                                log.info("Published productListRefreshedEvent")
+                            except Exception as e:
+                                log.error(f"Failed to publish: {e}")
+                        threading.Thread(target=_publish_refresh, daemon=True).start()
                 elif request_type == "subscriptionsRequest":
                     header = build_header()
                     response = encode_field(FIELD_HEADER, 2, header) + encode_field(78, 2, b"")
@@ -579,14 +622,15 @@ def run_pub_server(context):
     pub_socket = socket
     log.info(f"PUB server listening on tcp://127.0.0.1:{PUB_PORT}")
 
-    # Periodically publish heartbeat events
+    # Periodically publish daemonStatusEvent (field 44, tag 354)
+    # ZMQ PUB messages must be multipart: [channel, protobuf_data]
     while True:
         try:
             time.sleep(30)
-            # Heartbeat event (field 42 in the outer message based on JS code)
-            heartbeat = encode_field(1, 2, build_header())
-            socket.send(heartbeat)
-            log.debug("Published heartbeat")
+            status_body = encode_field(1, 0, 1)  # status = 1 (ok)
+            heartbeat = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(44, 2, status_body)
+            socket.send_multipart([b"daemon/event", heartbeat])
+            log.debug("Published daemonStatusEvent")
         except zmq.ZMQError as e:
             if e.errno == zmq.ETERM:
                 break
