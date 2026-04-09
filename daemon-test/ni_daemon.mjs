@@ -23,6 +23,8 @@ let storedTokens = {};
 let pub = null;
 // Track active deployments for progress reporting
 const activeDeployments = new Map(); // deploymentId -> { upid, title, progress, state }
+// Track installed products
+const installedProducts = new Set(); // upids that have been downloaded/installed
 
 // ============================================================================
 // Protobuf helpers
@@ -289,7 +291,7 @@ async function handleKnownProducts() {
       const product = Buffer.concat([
         encodeField(1, 2, p.upid),
         encodeField(3, 2, title),
-        encodeField(7, 0, 0),  // installed = false
+        encodeField(7, 0, 0),  // installed = false (download != install)
         encodeField(11, 0, 1), // activationState = ACTIVATED
         encodeField(12, 0, 1), // isOwned = true
         encodeField(15, 0, 1), // isInstallable = true
@@ -427,9 +429,11 @@ async function processDeployments(deploymentsWithIds) {
       if (dep) dep.state = 4; // COMPLETED
       await publishEvent(26, evBody); // installationSucceededEvent
 
-      // Remove from active deployments
+      // Mark as installed and remove from active
+      installedProducts.add(upid);
       activeDeployments.delete(deploymentId);
       await publishEvent(90); // downloadQueueChangedEvent
+      await publishEvent(85); // productListRefreshedEvent — triggers UI to re-fetch products
       log("info", `Completed: ${filename}`);
     } catch (e) {
       log("error", `Download failed: ${e.message}`);
