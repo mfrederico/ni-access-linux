@@ -378,11 +378,20 @@ def handle_auth0_access_token():
 
 
 def handle_get_preferences():
-    """Return default preferences."""
+    """Return default preferences with Linux paths."""
     header = build_header()
+    # Preferences (G type):
+    #   field 1 = downloadLocation (string)
+    #   field 2 = contentLocation (string)
+    #   field 3 = installLocation (string)
+    #   field 4 = dataTrackingEnabled (bool)
+    prefs_inner = (
+        encode_field(1, 2, os.path.expanduser("~/NI-Downloads")) +
+        encode_field(2, 2, os.path.expanduser("~/NI-Instruments")) +
+        encode_field(3, 2, "/usr/lib/vst")
+    )
     # PreferencesResponse has field 1 = Preferences message (nested)
-    # Return empty preferences (valid but no data)
-    prefs_body = encode_field(1, 2, b"")  # empty nested Preferences message
+    prefs_body = encode_field(1, 2, prefs_inner)
     return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_GET_PREFERENCES_RESPONSE, 2, prefs_body)
 
 
