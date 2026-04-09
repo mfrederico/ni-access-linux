@@ -642,6 +642,13 @@ def _process_deployments(deployments):
         update_id = artifact.get("update_id", "")
         log.info(f"Downloading {filename} for {upid} (update_id={update_id[:16]}...)")
 
+        # Publish downloadEnqueuedEvent (field 57)
+        if pub_socket:
+            event_body = encode_field(1, 2, deployment_id) + encode_field(2, 2, upid)
+            event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(57, 2, event_body)
+            pub_socket.send_multipart([b"daemon/event", event])
+            log.info(f"Published downloadEnqueuedEvent for {filename}")
+
         # Publish downloadStartedEvent (field 20)
         if pub_socket:
             event_body = encode_field(1, 2, deployment_id) + encode_field(2, 2, upid)
@@ -708,17 +715,10 @@ def _process_deployments(deployments):
                 event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(24, 2, event_body)
                 pub_socket.send_multipart([b"daemon/event", event])
 
-            # Auto-install .deb files
+            # Log install hint for .deb files
             if filename.endswith(".deb"):
-                log.info(f"Installing {filename}...")
-                result = subprocess.run(
-                    ["sudo", "dpkg", "--force-depends", "-i", dest],
-                    capture_output=True, text=True, timeout=120,
-                )
-                if result.returncode == 0:
-                    log.info(f"Installed {filename} successfully")
-                else:
-                    log.error(f"Install failed: {result.stderr}")
+                log.info(f"Downloaded .deb: {dest}")
+                log.info(f"To install manually: sudo dpkg --force-depends -i {dest}")
 
             # Publish installationSucceededEvent (field 26)
             if pub_socket:
@@ -757,6 +757,11 @@ def run_req_server(context):
         try:
             raw = socket.recv()
             log.debug(f"Received {len(raw)} bytes: {raw[:50].hex()}...")
+
+            # Signal that NA has connected
+            global startup_published
+            if not startup_published:
+                startup_published = True
 
             try:
                 fields = decode_fields(raw)
@@ -826,6 +831,7 @@ def run_req_server(context):
 
 
 pub_socket = None
+startup_published = False
 
 def run_pub_server(context):
     """PUB server — publishes events to plugins."""
@@ -835,15 +841,36 @@ def run_pub_server(context):
     pub_socket = socket
     log.info(f"PUB server listening on tcp://127.0.0.1:{PUB_PORT}")
 
-    # Periodically publish daemonStatusEvent (field 44, tag 354)
+    # Wait for NA to connect (first REQ will set this flag), then send startup
     # ZMQ PUB messages must be multipart: [channel, protobuf_data]
+    global startup_published
+    while not startup_published:
+        time.sleep(0.5)
+
+    time.sleep(1)  # Give subscriber a moment after REQ connection
+
+    # STARTUP_STARTED (type=1)
+    status_body = encode_field(1, 0, 1)
+    event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(44, 2, status_body)
+    socket.send_multipart([b"daemon/event", event])
+    log.info("Published daemonStatusEvent: STARTUP_STARTED")
+
+    time.sleep(1)
+
+    # STARTUP_ENDED (type=2)
+    status_body = encode_field(1, 0, 2)
+    event = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(44, 2, status_body)
+    socket.send_multipart([b"daemon/event", event])
+    log.info("Published daemonStatusEvent: STARTUP_ENDED")
+
+    # Periodic HEARTBEAT (type=3)
     while True:
         try:
             time.sleep(30)
-            status_body = encode_field(1, 0, 1)  # status = 1 (ok)
+            status_body = encode_field(1, 0, 3)
             heartbeat = encode_field(FIELD_HEADER, 2, build_header()) + encode_field(44, 2, status_body)
             socket.send_multipart([b"daemon/event", heartbeat])
-            log.debug("Published daemonStatusEvent")
+            log.debug("Published daemonStatusEvent: HEARTBEAT")
         except zmq.ZMQError as e:
             if e.errno == zmq.ETERM:
                 break
