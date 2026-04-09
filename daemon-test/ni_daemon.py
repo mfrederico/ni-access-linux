@@ -483,7 +483,23 @@ def handle_known_products():
         product_entries = b""
         for p in products:
             upid = p.get("upid", "")
-            title = upid_titles.get(upid, upid[:8])
+            title = upid_titles.get(upid, "")
+            if not title:
+                # Try product API as fallback
+                try:
+                    pr = http_requests.get(
+                        f"https://api.native-instruments.com/v1/products/{upid}",
+                        headers={"Authorization": f"Bearer {app_token}", "Accept": "application/json", "User-Agent": "NativeAccess/3.24.0"},
+                        timeout=5,
+                    )
+                    if pr.status_code == 200:
+                        resources = pr.json().get("response_body", {}).get("resources", [])
+                        title = next((r["value"] for r in resources if r["key"] == "name"), "")
+                except:
+                    pass
+            if not title:
+                log.debug(f"Skipping product with no title: {upid}")
+                continue
 
             # Build KnownProduct protobuf
             # field 1 = upid (string)
