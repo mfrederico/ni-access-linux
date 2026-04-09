@@ -195,6 +195,14 @@ def identify_request(fields):
         return "knownProductsRequest"
     if 42 in field_nums:
         return "userInfoRequest"
+    if 51 in field_nums:
+        return "setPreferencesRequest"
+    if 77 in field_nums:
+        return "subscriptionsRequest"
+    if 87 in field_nums:
+        return "refreshProductListRequest"
+    if 67 in field_nums:
+        return "currentKompleteHddsRequest"
     if FIELD_LOGIN_REQUEST in field_nums:
         return "loginRequest"
     if FIELD_LOGOUT_REQUEST in field_nums:
@@ -412,9 +420,69 @@ def handle_user_info():
 
 
 def handle_known_products():
-    """Return empty known products list."""
+    """Return known products from NI API."""
     header = build_header()
-    return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_KNOWN_PRODUCTS_RESPONSE, 2, b"")
+    access_token = stored_tokens.get("access_token", "")
+    if not access_token:
+        return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_KNOWN_PRODUCTS_RESPONSE, 2, b"")
+
+    try:
+        import requests as http_requests
+        app_token = (
+            "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9."
+            "eyJpYXQiOjE2MzQ3MzA1MjYsInN1YiI6ImFwcGxpY2F0aW9uIiwiZGF0YSI6eyJuYW1lIjoiTmF0aXZlQWNjZXNzIiwidmVyc2lvbiI6IjIuMCJ9LCJleHAiOjI1MzQwMjMwMDc5OX0."
+            "U6EQdp8WNcOyYFIHWw9tGUDUCEtxSuLmqEOfLB2UCZMYUkmsV5TItuKPbPCg5-_s7Ls3_4vbMDpisfGqXretddhVnBg-UoSJB4vj4RZtZq29_KaSly9cFA2A5lVbCDEM1bKNkKfNSyfDM6Whkdu2ub3aqt3LgAg7dfMVI3-_MY24txhZNW8xQ44M1nVsiUkpMk7nqrhIwcnb7EX-DPLbIQQ2NCLtoEGiA9eeCu19RvekxTxbttghDptkFBYqs_6CTiKmg98BkU8kQn2225LuzLIeD43vA6yHGyPwyvZloO1Pid5TcRH5qjqjLcfnCk65lSEGR39fZY_AnuDQAtF4tg"
+        )
+
+        # Get user's products
+        resp = http_requests.get(
+            "https://api.native-instruments.com/v1/users/me/products",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "X-NI-App-Token": app_token,
+                "Accept": "application/json",
+                "User-Agent": "NativeAccess/3.24.0",
+            },
+            timeout=15,
+        )
+        data = resp.json()
+        products = data.get("response_body", {}).get("products", [])
+        log.info(f"Fetched {len(products)} products from NI API")
+
+        # Look up product names
+        product_entries = b""
+        for p in products:
+            upid = p.get("upid", "")
+            # Get product name
+            try:
+                name_resp = http_requests.get(
+                    f"https://api.native-instruments.com/v1/products/{upid}",
+                    headers={"Authorization": f"Bearer {app_token}", "Accept": "application/json", "User-Agent": "NativeAccess/3.24.0"},
+                    timeout=10,
+                )
+                name_data = name_resp.json()
+                resources = name_data.get("response_body", {}).get("resources", [])
+                title = next((r["value"] for r in resources if r["key"] == "name"), upid[:8])
+            except:
+                title = upid[:8]
+
+            # Build KnownProduct protobuf
+            # field 1 = upid (string), field 3 = title (string)
+            # field 11 = activationState (int32, 1=activated), field 12 = isOwned (bool)
+            product_pb = (
+                encode_field(1, 2, upid) +     # upid
+                encode_field(3, 2, title) +    # title
+                encode_field(11, 0, 1) +       # activationState = ACTIVATED
+                encode_field(12, 0, 1)         # isOwned = true
+            )
+            product_entries += encode_field(1, 2, product_pb)
+
+        log.info(f"Built knownProductsResponse with {len(products)} products")
+        return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_KNOWN_PRODUCTS_RESPONSE, 2, product_entries)
+
+    except Exception as e:
+        log.error(f"Failed to fetch products: {e}")
+        return encode_field(FIELD_HEADER, 2, header) + encode_field(WIRE_KNOWN_PRODUCTS_RESPONSE, 2, b"")
 
 
 def handle_unknown(request_type, raw_data):
@@ -460,6 +528,18 @@ def run_req_server(context):
                     response = handle_user_info()
                 elif request_type == "knownProductsRequest":
                     response = handle_known_products()
+                elif request_type == "setPreferencesRequest":
+                    header = build_header()
+                    response = encode_field(FIELD_HEADER, 2, header) + encode_field(52, 2, b"")
+                elif request_type == "refreshProductListRequest":
+                    # Return known products again
+                    response = handle_known_products()
+                elif request_type == "subscriptionsRequest":
+                    header = build_header()
+                    response = encode_field(FIELD_HEADER, 2, header) + encode_field(78, 2, b"")
+                elif request_type == "currentKompleteHddsRequest":
+                    header = build_header()
+                    response = encode_field(FIELD_HEADER, 2, header) + encode_field(68, 2, b"")
                 elif request_type == "isLoggedInRequest":
                     response = handle_is_logged_in()
                 else:
