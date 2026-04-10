@@ -426,13 +426,21 @@ async function processDeployments(deploymentsWithIds) {
       if (dep) dep.state = 3; // INSTALLING
       await publishEvent(24, evBody); // installationStartedEvent
 
-      // Auto-install Windows plugins via Proton
+      // Unzip Windows installers for easy access
       if (filename.endsWith(".zip")) {
         try {
-          await installViaProton(dest, filename, deploymentId, upid);
-          installedProducts.add(upid);
+          const { execSync } = await import("child_process");
+          const extractDir = join(DOWNLOAD_DIR, "installers");
+          mkdirSync(extractDir, { recursive: true });
+          execSync(`unzip -o "${dest}" -d "${extractDir}"`, { timeout: 120000 });
+          const files = (await import("fs")).readdirSync(extractDir);
+          const exe = files.find(f => f.endsWith(".exe"));
+          if (exe) {
+            log("info", `Installer ready: ${join(extractDir, exe)}`);
+            log("info", "To install: Add as Non-Steam Game in Steam, set Proton, click Play");
+          }
         } catch (e) {
-          log("error", `Proton install failed: ${e.message}`);
+          log("error", `Unzip failed: ${e.message}`);
         }
       }
 
@@ -490,6 +498,7 @@ async function installViaProton(zipPath, filename, deploymentId, upid) {
     ...process.env,
     STEAM_COMPAT_DATA_PATH: compatPath,
     STEAM_COMPAT_CLIENT_INSTALL_PATH: join(homedir(), ".steam/steam"),
+    DISPLAY: process.env.DISPLAY || ":1",
   };
 
   // Unzip
