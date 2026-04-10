@@ -1,27 +1,35 @@
 # NI Access for Linux
 
-Run [Native Instruments](https://www.native-instruments.com) Native Access and your NI plugins natively on Linux. Browse your product library, download installers, and use your plugins in Bitwig, Ardour, or any Linux DAW.
+Run [Native Instruments](https://www.native-instruments.com) Native Access and your NI plugins on Linux. Browse your product library, download installers, and use your plugins in Bitwig, Ardour, or any Linux DAW via [yabridge](https://github.com/robbert-vdh/yabridge).
 
 This project includes:
 - **Native Access** running natively via Linux Electron (no Wine for the UI)
-- **Python NTKDaemon** replacement that handles the ZMQ protocol
+- **Node.js NTKDaemon** replacement that handles the ZMQ protocol
 - **Web UI** for quick product browsing and downloads
-- **Setup scripts** for dependency installation
+- **Automatic download** with progress bar through Native Access
 
 ## Quick Start
 
-### 1. Clone and install dependencies
+### Prerequisites
+- **Node.js** 18+ (`node --version`)
+- **Steam** with Proton installed (any 9.0+)
+- **yabridge** — [download from GitHub releases](https://github.com/robbert-vdh/yabridge/releases)
+- **p7zip** — `sudo apt install p7zip-full`
+
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/mfrederico/ni-access-linux.git
 cd ni-access-linux
 
-pip install requests pyzmq
-sudo apt install p7zip-full    # for extracting installers
-sudo apt install aria2         # optional, faster downloads
+# Install daemon dependencies
+cd daemon-test && npm install && cd ..
+
+# Install Python dependencies (for web UI)
+pip install requests
 ```
 
-### 2. Download and extract Native Access
+### 2. Set up Native Access
 
 ```bash
 # Download the Windows installer
@@ -31,42 +39,41 @@ wget https://www.native-instruments.com/fileadmin/downloads/Native-Access_2.exe
 7z x Native-Access_2.exe -o./ni-installer
 7z x './ni-installer/$PLUGINSDIR/app-64.7z' -o./ni-installer/extracted
 
-# Extract and patch the Electron app
+# Extract the Electron app
 npx --yes @electron/asar extract ./ni-installer/extracted/resources/app.asar ./app-extracted
+
+# Install Electron 40.6.0
+npx --yes electron@40.6.0 --version
 ```
 
 ### 3. Patch Native Access for Linux
 
-Apply the Linux platform patches to `app-extracted/out/main/index.js`:
+Apply these patches to `app-extracted/out/main/index.js`:
 
-**Patch 1** — Add Linux path support (~line 118): after the `case "win32":` return statement, add:
+**Patch 1** — Add Linux path support (~line 118):
 ```javascript
       case "linux":
         return H.join(process.env.XDG_CONFIG_HOME ?? H.join(process.env.HOME ?? "", ".config"), ...t);
 ```
 
-**Patch 2** — Add Linux public data path (~line 135): after the `case "win32":` return statement, add:
+**Patch 2** — Add Linux public data path (~line 135):
 ```javascript
     case "linux":
       return H.join(process.env.XDG_DATA_HOME ?? H.join(process.env.HOME ?? "", ".local", "share"), e);
 ```
 
-**Patch 3** — Add Linux to shared documents path (~line 8788): after the `case "win32":` return statement, add:
+**Patch 3** — Add Linux shared documents path (~line 8788):
 ```javascript
     case "linux":
       return H.resolve(process.env.XDG_DATA_HOME ?? H.join(process.env.HOME ?? "", ".local", "share"));
 ```
 
-**Patch 4** — Add `"linux"` to the supported platforms array (~line 8873):
+**Patch 4** — Add `"linux"` to supported platforms (~line 8873):
 ```javascript
-const ul = [
-  "darwin",
-  "win32",
-  "linux"
-];
+const ul = ["darwin", "win32", "linux"];
 ```
 
-**Patch 5** — Make platform lookup fall back to win32 for Linux (~line 8857):
+**Patch 5** — Platform lookup fallback (~line 8857):
 ```javascript
 function _e(e) {
   const t = re.platform();
@@ -78,7 +85,6 @@ function _e(e) {
 
 **Patch 6** — Force packaged mode on Linux (~line 10211):
 ```javascript
-function mu() {
   if (w.isPackaged || process.platform === "linux") return Lp;
 ```
 
@@ -88,23 +94,17 @@ function mu() {
     `${t === "darwin" ? "open" : t === "linux" ? "xdg-open" : "start"} "${e}"`,
 ```
 
-Then repack the asar:
+Then repack:
 ```bash
 npx --yes @electron/asar pack ./app-extracted ./native-access-linux/resources/app.asar
 cp -r ./ni-installer/extracted/resources/app.asar.unpacked ./native-access-linux/resources/
 ```
 
-### 4. Install Electron
+### 4. Run
 
 ```bash
-npx --yes electron@40.6.0 --version   # downloads Electron 40.6.0
-```
-
-### 5. Start the daemon and Native Access
-
-```bash
-# Terminal 1: Start the Python NTKDaemon
-python3 daemon-test/ni_daemon.py
+# Terminal 1: Start the daemon
+cd daemon-test && node ni_daemon.mjs
 
 # Terminal 2: Start Native Access
 ~/.npm/_npx/*/node_modules/electron/dist/electron --no-sandbox ./native-access-linux/resources/app.asar
@@ -115,62 +115,19 @@ Or use the restart script:
 bash daemon-test/restart.sh
 ```
 
-Native Access will open, show a login screen, and after you log in with your NI account, your product library will appear with names and artwork.
+## Installing Plugins (yabridge)
 
-## Installing NI Plugins
+All NI plugins are installed via **Steam + Proton + yabridge** for full GUI support.
 
-### Native Linux plugins (.deb)
-
-Several NI products ship native Linux `.deb` installers (Kontakt 8, Reaktor 6, FM8, and many effects). To install them:
+### One-time setup
 
 ```bash
-# 1. Install the ni-plugin-info stub (required dependency)
-sudo dpkg -i ni-plugin-info.deb
+# 1. Install yabridge to ~/.local/share/yabridge/
+# Download from: https://github.com/robbert-vdh/yabridge/releases
 
-# 2. Install compatibility libraries (Ubuntu 24.04)
-sudo bash setup-deps.sh
-
-# 3. Download and install the .deb
-#    (use the web UI at localhost:6510 or download via Native Access)
-sudo dpkg --force-depends -i ~/NI-Downloads/Kontakt_8_Installer.deb
-```
-
-**Note:** The native Linux builds are headless audio engines — they work in your DAW but don't have a GUI. For the full GUI experience, use the Windows version via yabridge (below).
-
-### Windows plugins via Steam + Proton + yabridge
-
-This is the recommended approach for plugins with GUIs (Kontakt, Ozone, Massive, etc.):
-
-#### Prerequisites
-```bash
-# Install yabridge from https://github.com/robbert-vdh/yabridge/releases
-# Extract to ~/.local/share/yabridge/
-
-# Install Proton via Steam (any version 9.0+)
-# Steam > Settings > Compatibility > Enable Steam Play
-```
-
-#### Install a plugin
-
-1. Download the Windows (PC) `.zip` installer using Native Access or the web UI
-2. Unzip it: `unzip ~/NI-Downloads/Kontakt_7_Installer.zip -d /tmp/kontakt-install`
-3. In Steam: **Library > Add a Game > Add a Non-Steam Game**
-4. Browse to the `.exe` installer (e.g., `/tmp/kontakt-install/Kontakt 7 7.9.0 Setup PC.exe`)
-5. Right-click the game > **Properties > Compatibility** > Force **Proton 9.0** (or Hotfix)
-6. Click **Play** — the Windows installer GUI will appear
-7. Complete the installation
-
-#### Bridge with yabridge
-
-```bash
-# Find where the VST3 was installed
-find ~/.steam/steam/steamapps/compatdata -name "*.vst3" -path "*/VST3/*"
-
-# Add the VST3 directory to yabridge
-yabridgectl add "/path/to/compatdata/XXXXX/pfx/drive_c/Program Files/Common Files/VST3"
-
-# Create a Wine wrapper (point to the same Proton used for install)
+# 2. Create Wine wrapper scripts pointing to Proton
 mkdir -p ~/.local/bin
+
 cat > ~/.local/bin/wine << 'EOF'
 #!/bin/bash
 PROTON="$HOME/.steam/steam/steamapps/common/Proton Hotfix/files"
@@ -188,57 +145,44 @@ exec "$PROTON/bin/wineserver" "$@"
 EOF
 chmod +x ~/.local/bin/wineserver
 
-# Sync yabridge
-WINEPREFIX="/path/to/compatdata/XXXXX/pfx" yabridgectl sync
-
-# Verify
-yabridgectl status
+# 3. Add yabridge VST3 path to Bitwig
+# Settings > Plug-ins > Locations > add: ~/.vst3/yabridge
 ```
 
-#### Configure Bitwig
+### Installing a plugin
 
-1. **Settings > Plug-ins > Locations** — add `~/.vst3/yabridge`
-2. **Settings > Plug-ins** — enable "Allow all plugins"
-3. Click **Rescan**
-4. Your NI plugins should appear with full GUIs
+1. **Download** via Native Access (click Install — downloads to `~/NI-Downloads/`)
+2. **Unzip** — the daemon auto-extracts `.zip` files to `~/NI-Downloads/installers/`
+3. **Add to Steam** — Library > Add Non-Steam Game > Browse to the `.exe` in `~/NI-Downloads/installers/`
+4. **Set Proton** — Right-click > Properties > Compatibility > Force Proton 9.0 (or Hotfix)
+5. **Run** — Click Play, complete the installer wizard
+6. **Bridge** — Find the VST3 and sync yabridge:
+   ```bash
+   # Find where it installed
+   find ~/.steam/steam/steamapps/compatdata -name "*.vst3" -path "*/VST3/*"
+   
+   # Add to yabridge
+   yabridgectl add "<path>/drive_c/Program Files/Common Files/VST3"
+   WINEPREFIX="<path>" yabridgectl sync
+   ```
+7. **Rescan** in Bitwig — your plugin appears with full GUI
 
 ## Web UI (Alternative)
 
 For a lightweight experience without Native Access:
 
 ```bash
+pip install requests
 python3 ni_access.py
 # Open http://localhost:6510
-```
-
-The web UI lets you log in, browse products, and download installers directly.
-
-## Compatibility Libraries (Ubuntu 24.04)
-
-NI's native Linux plugins need older library versions. The `setup-deps.sh` script handles this automatically:
-
-```bash
-sudo bash setup-deps.sh
-```
-
-It installs:
-- **OpenSSL 1.1** — from Ubuntu 22.04 repos (coexists with OpenSSL 3)
-- **xerces-c 3.1** — extracted from .deb (avoids ICU dependency chain)
-- **ICU 55** — extracted from .deb (needed by xerces-c 3.1)
-- **ni-plugin-info** — stub package that satisfies NI .deb dependencies
-
-Also create the NI registry directory:
-```bash
-sudo mkdir -p /ni/shared
-sudo chmod 777 /ni/shared
 ```
 
 ## Architecture
 
 ```
 ┌─────────────────────┐     ┌──────────────────┐
-│   Native Access      │────▶│  Python Daemon    │
-│   (Electron 40.6.0)  │◀────│  (ni_daemon.py)   │
+│   Native Access      │────▶│  Node.js Daemon   │
+│   (Electron 40.6.0)  │◀────│  (ni_daemon.mjs)  │
 │                       │     │                    │
 │   Patched app.asar   │     │  ZMQ REQ/REP :5146 │
 │   Linux platform     │     │  ZMQ PUB     :5563 │
@@ -251,39 +195,34 @@ sudo chmod 777 /ni/shared
                               └────────────────┘
 ```
 
-- **Native Access** — NI's Electron app, patched for Linux platform support
-- **Python Daemon** — Replaces the Windows NTKDaemon service; speaks protobuf over ZMQ
-- **NI Cloud API** — Authentication (Auth0), product catalog, download URLs (metalink/CDN)
-
 ## Project Structure
 
 ```
 ni-access-linux/
 ├── ni_access.py           # Web UI for product browsing/downloads
 ├── daemon-test/
-│   ├── ni_daemon.py       # Python NTKDaemon replacement
-│   └── restart.sh         # Quick restart script for development
-├── ni-plugin-info         # Stub for NI .deb dependency
-├── ni-plugin-info.deb     # Packaged stub
-├── setup-deps.sh          # Compatibility library installer
-└── install-ni-linux.sh    # Legacy Wine-based installer (deprecated)
+│   ├── ni_daemon.mjs      # Node.js NTKDaemon replacement
+│   ├── package.json       # zeromq dependency
+│   └── restart.sh         # Quick restart for development
+└── README.md
 ```
 
 ## Known Limitations
 
-- **Plugin activation** — Kontakt/Reaktor require license activation through the daemon. The Python daemon handles auth but full activation flow is still in progress.
-- **Native Linux plugins have no GUI** — NI's Linux builds are headless audio engines. Use Windows versions via yabridge for the full GUI.
-- **Download via Native Access** — "Install" button in NA is not yet wired to the download flow. Use the web UI (`ni_access.py`) for downloads in the meantime.
-- **Some legacy products** — Older products (KORE PLAYER, original Ozone 8) may not appear as their API entries have been retired.
+- **Plugin installation** — Download is automated but installation requires adding the `.exe` as a Non-Steam Game (Proton's GUI needs Steam context)
+- **Time remaining** — Download progress bar works but time estimate stays on "Calculating"
+- **Some legacy products** — Older NI products may not appear (retired API entries)
+- **Plugin activation** — Kontakt requires license activation through NI's servers; the daemon handles auth but full activation via kreator IPC is still in progress
 
 ## Contributing
 
-This project was built by reverse-engineering NI's public APIs and protocol. Key areas that need help:
+Key areas that need help:
 
-1. **Download flow in daemon** — Wire up `startDeploymentsRequest` to actually download and install products
-2. **More platform patches** — Test on different distros (Fedora, Arch, etc.)
-3. **Plugin activation** — Complete the kreator IPC protocol for plugin license verification
-4. **Content library management** — Extract and register Kontakt libraries from ISOs
+1. **Automated Proton installation** — Make `proton run` work for GUI installers without Steam
+2. **Plugin activation** — Complete the kreator IPC protocol for license verification
+3. **Content library management** — Extract and register Kontakt libraries from ISOs
+4. **Distro testing** — Test on Fedora, Arch, etc.
+5. **Progress bar refinement** — Time remaining estimate, smoother updates
 
 ## License
 
